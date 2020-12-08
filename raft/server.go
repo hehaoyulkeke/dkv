@@ -8,6 +8,8 @@ import (
 	"sync"
 )
 
+type Message = map[string]interface{}
+
 // Server wraps a raft.Raft along with a rpc.Server that exposes its
 // methods as RPC endpoints. It also manages the peers of the Raft server. The
 // main goal of this type is to simplify the code of raft.Server for
@@ -16,6 +18,7 @@ import (
 // RPC server.
 type Server struct {
 	mu sync.Mutex
+	dbLock sync.RWMutex
 
 	serverId int
 	serverStr string
@@ -24,12 +27,11 @@ type Server struct {
 	rf      *Raft
 	db  Storage
 	commitChan  chan CommitEntry
-	quit  chan interface{}
 	wg    sync.WaitGroup
 	enc *json.Encoder
 	applyChs 	map[int]chan int
 	rpcSeq int
-	rpcCh chan Message
+	rpcChs map[int]chan Message
 }
 
 func NewServer(serverId string, peerIds []int) *Server {
@@ -37,11 +39,11 @@ func NewServer(serverId string, peerIds []int) *Server {
 	s.serverStr = serverId
 	s.serverId = str2Int(serverId)
 	s.peerIds = peerIds
+	s.db = NewMapStorage()
 	s.commitChan = make(chan CommitEntry)
-	s.quit = make(chan interface{})
 	s.applyChs = make(map[int]chan int)
 	s.rpcSeq = 1
-	s.rpcCh = make(chan Message, 100)
+	s.rpcChs = make(map[int]chan Message)
 	return s
 }
 
@@ -54,12 +56,16 @@ func (s *Server) Serve() {
 	}
 	defer conn.Close()
 
-	req := make(map[string]interface{})
 	s.enc = json.NewEncoder(conn)
 	dec := json.NewDecoder(conn)
-	go s.receiveNewMsg()
-
+	s.wg.Add(1)
+	go func() {
+		s.processAppliedOps()
+		s.wg.Done()
+	}()
+	//read message from net
 	for {
+		req := make(Message)
 		err := dec.Decode(&req)
 		if err != nil {
 			fmt.Println(err)
@@ -67,16 +73,15 @@ func (s *Server) Serve() {
 		} else {
 			s.wg.Add(1)
 			go func() {
-				s.handleGet(req)
+				s.handleMessage(req)
 				s.wg.Done()
 			}()
 		}
 	}
+	s.wg.Wait()
 }
 
-type Message = map[string]interface{}
-
-func (s *Server) handleMessage(conn net.Conn, msg Message) {
+func (s *Server) handleMessage(msg Message) {
 	msgType := msg["type"]
 	switch msgType {
 	case GET:
@@ -86,10 +91,10 @@ func (s *Server) handleMessage(conn net.Conn, msg Message) {
 		reply := s.handlePut(msg)
 		s.enc.Encode(&reply)
 	case REQUEST_VOTE_SEND:
-		reply := s.handleAppendEntriesSend(msg)
+		reply := s.handleRequestVoteSend(msg)
 		s.enc.Encode(&reply)
 	case REQUEST_VOTE_RECV:
-		s.handleAppendEntriesRecv(msg)
+		s.handleRequestVoteRecv(msg)
 	case APPEND_ENTRIES_SEND:
 		reply := s.handleAppendEntriesSend(msg)
 		s.enc.Encode(&reply)
@@ -103,6 +108,7 @@ func (s *Server) newReply(msg Message) Message{
 	reply["src"] = s.serverStr
 	reply["dst"] = msg["src"]
 	reply["MID"] = msg["MID"]
+	reply["leader"] = UNKNOWN
 	return reply
 }
 
@@ -130,24 +136,24 @@ func (s *Server) handleGet(msg Message) Message {
 	select{
 	case msgTerm := <- ch:
 		if msgTerm == term {
-			s.mu.Lock()
+			s.dbLock.RLock()
 			if val, ok := s.db.Get(msg["key"].(string)); ok{
 				reply["value"] = val
-				reply["type"] = OK
+			} else {
+				reply["value"] = ""
 			}
-			s.mu.Unlock()
+			s.dbLock.RUnlock()
 		}
 	}
 
-	go func() {s.closeCh(index)}()
+	s.wg.Add(1)
+	go func() {
+		s.closeApplyCh(index)
+		s.wg.Done()
+	}()
+	reply["leader"] = s.serverStr
+	reply["type"] = OK
 	return reply
-}
-
-func (s *Server) closeCh(index int){
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	close(s.applyChs[index])
-	delete(s.applyChs, index)
 }
 
 func (s *Server) handlePut(msg Message) Message {
@@ -169,13 +175,24 @@ func (s *Server) handlePut(msg Message) Message {
 	select{
 	case <- ch:
 	}
-	go func() {s.closeCh(index)}()
+	s.wg.Add(1)
+	go func() {
+		s.closeApplyCh(index)
+		s.wg.Done()
+	}()
+	reply["leader"] = s.serverStr
+	reply["type"] = OK
 	return reply
 }
 
 
 func (s *Server) handleRequestVoteSend(msg Message) Message {
-	args := RequestVoteArgs{}
+	args := RequestVoteArgs{
+		Term:         int(msg["Term"].(float64)),
+		CandidateId:  int(msg["CandidateId"].(float64)),
+		LastLogIndex: int(msg["LastLogIndex"].(float64)),
+		LastLogTerm:  int(msg["LastLogTerm"].(float64)),
+	}
 	requestReply := new(RequestVoteReply)
 	reply := s.newReply(msg)
 	if err := s.rf.RequestVote(args, requestReply); err != nil {
@@ -184,12 +201,17 @@ func (s *Server) handleRequestVoteSend(msg Message) Message {
 		reply["type"] = REQUEST_VOTE_RECV
 		reply["Term"] = requestReply.Term
 		reply["VoteGranted"] = requestReply.VoteGranted
+		reply["rpcSeq"] = msg["rpcSeq"]
 	}
 	return reply
 }
 
 func (s *Server) handleRequestVoteRecv(msg Message) {
-	s.rpcCh <- msg
+	s.mu.Lock()
+	index := int(msg["rpcSeq"].(float64))
+	ch := s.rpcChs[index]
+	s.mu.Unlock()
+	ch <- msg
 }
 
 func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *RequestVoteReply) error {
@@ -211,19 +233,45 @@ func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *Reques
 		return err
 	}
 	for {
-		resp := <- s.rpcCh
-		if resp["rpcSeq"].(int) != rpcSeq {
-			s.rpcCh <- resp
-		} else {
-			reply.Term = resp["Term"].(int)
-			reply.VoteGranted = resp["VoteGranted"].(bool)
-			return nil
-		}
+		s.mu.Lock()
+		ch := make(chan Message)
+		index := rpcSeq
+		s.rpcChs[index] = ch
+		s.mu.Unlock()
+		resp := <- ch
+		reply.Term = int(resp["Term"].(float64))
+		reply.VoteGranted = resp["VoteGranted"].(bool)
+		s.wg.Add(1)
+		go func() {
+			s.closeRpcCh(rpcSeq)
+			s.wg.Done()
+		}()
+		return nil
 	}
 }
 
 func (s *Server) handleAppendEntriesSend(msg Message) Message {
-	args := AppendEntriesArgs{}
+	args := AppendEntriesArgs{
+		Term:         int(msg["Term"].(float64)),
+		LeaderId:     int(msg["LeaderId"].(float64)),
+		PrevLogIndex: int(msg["PrevLogIndex"].(float64)),
+		PrevLogTerm:  int(msg["PrevLogTerm"].(float64)),
+		LeaderCommit: int(msg["LeaderCommit"].(float64)),
+	}
+	if msg["Entries"] != nil {
+		entries := msg["Entries"].([]interface{})
+		args.Entries = make([]LogEntry, len(entries))
+		for i := range entries {
+			tmp := entries[i].(map[string]interface{})
+			e := LogEntry{
+				Command: tmp["Command"],
+				Term:    int(tmp["Term"].(float64)),
+			}
+			args.Entries[i] = e
+		}
+	} else {
+		args.Entries = nil
+	}
 	appendReply := new(AppendEntriesReply)
 	reply := s.newReply(msg)
 	if err := s.rf.AppendEntries(args, appendReply); err != nil {
@@ -234,12 +282,17 @@ func (s *Server) handleAppendEntriesSend(msg Message) Message {
 		reply["Success"] = appendReply.Success
 		reply["ConflictIndex"] = appendReply.ConflictIndex
 		reply["ConflictTerm"] = appendReply.ConflictTerm
+		reply["rpcSeq"] = msg["rpcSeq"]
 	}
 	return reply
 }
 
 func (s *Server) handleAppendEntriesRecv(msg Message) {
-	s.rpcCh <- msg
+	s.mu.Lock()
+	index := int(msg["rpcSeq"].(float64))
+	ch := s.rpcChs[index]
+	s.mu.Unlock()
+	ch <- msg
 }
 
 func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *AppendEntriesReply) error {
@@ -262,39 +315,70 @@ func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *Ap
 		return err
 	}
 	for {
-		resp := <- s.rpcCh
-		if resp["rpcSeq"].(int) != rpcSeq {
-			s.rpcCh <- resp
-		} else {
-			reply.Term = resp["Term"].(int)
-			reply.Success = resp["Success"].(bool)
-			reply.ConflictIndex = resp["ConflictIndex"].(int)
-			reply.ConflictTerm = resp["ConflictTerm"].(int)
-			return nil
-		}
+		s.mu.Lock()
+		ch := make(chan Message)
+		index := rpcSeq
+		s.rpcChs[index] = ch
+		s.mu.Unlock()
+		resp := <- ch
+		reply.Term = int(resp["Term"].(float64))
+		reply.Success = resp["Success"].(bool)
+		reply.ConflictIndex = int(resp["ConflictIndex"].(float64))
+		reply.ConflictTerm = int(resp["ConflictTerm"].(float64))
+		s.wg.Add(1)
+		go func() {
+			s.closeRpcCh(rpcSeq)
+			s.wg.Done()
+		}()
+		return nil
 	}
 
 }
 
 
-
-func (s *Server) receiveNewMsg(){
+func (s *Server) processAppliedOps(){
 	for commitEntry := range s.commitChan {
-		s.mu.Lock()
 		index := commitEntry.Index
 		term := commitEntry.Term
 
-		op := commitEntry.Command.(Op)
-
+		var op Op
+		switch commitEntry.Command.(type) {
+		case Op:
+			op = commitEntry.Command.(Op)
+		case map[string]interface{}:
+			tmp := commitEntry.Command.(map[string]interface{})
+			op = Op{tmp["Method"].(string), tmp["Key"].(string), tmp["Value"].(string)}
+		}
 		switch op.Method {
 		case PUT:
+			s.dbLock.Lock()
 			s.db.Set(op.Key, op.Value)
+			s.dbLock.Unlock()
 		case GET:
 		}
+		s.mu.Lock()
 		if ch, ok := s.applyChs[index]; ok{
-			ch <- term
+			s.wg.Add(1)
+			go func() {
+				ch <- term
+				s.wg.Done()
+			}()
 		}
-
 		s.mu.Unlock()
+
 	}
+}
+
+func (s *Server) closeApplyCh(index int){
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	close(s.applyChs[index])
+	delete(s.applyChs, index)
+}
+
+func (s *Server) closeRpcCh(index int){
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	close(s.rpcChs[index])
+	delete(s.rpcChs, index)
 }

@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const Debugrf = 1
+const Debugrf = 0
 
 // CommitEntry is the data reported by Raft to the commit channel. Each commit
 // entry notifies the client that consensus was reached on a command and it can
@@ -120,8 +120,7 @@ func NewRaft(me int, peerIds []int, server *Server, commitChan chan<- CommitEntr
 
 
 	go func() {
-		// The rf is dormant until ready is signaled; then, it starts a countdown
-		// for leader election.
+		time.Sleep(300*time.Millisecond)
 		rf.mu.Lock()
 		rf.electionResetEvent = time.Now()
 		rf.mu.Unlock()
@@ -136,7 +135,7 @@ func NewRaft(me int, peerIds []int, server *Server, commitChan chan<- CommitEntr
 func (rf *Raft) Report() (index int, term int, isLeader bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return len(rf.log), rf.currentTerm, rf.state == Leader
+	return len(rf.log)-1, rf.currentTerm, rf.state == Leader
 }
 
 // Submit submits a new command to the rf. This function doesn't block; clients
@@ -146,7 +145,6 @@ func (rf *Raft) Report() (index int, term int, isLeader bool) {
 // a different rf to submit this command to.
 func (rf *Raft) Submit(command interface{}) (index int, term int, isLeader bool) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	rf.dlog("Submit received by %v: %v", rf.state, command)
 	if rf.state == Leader {
 		rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm})
@@ -155,7 +153,7 @@ func (rf *Raft) Submit(command interface{}) (index int, term int, isLeader bool)
 		rf.triggerAEChan <- struct{}{}
 		return len(rf.log), rf.currentTerm, true
 	}
-
+	rf.mu.Unlock()
 	return len(rf.log), rf.currentTerm, false
 }
 
@@ -336,7 +334,7 @@ func (rf *Raft) electionTimeout() time.Duration {
 	// If RAFT_FORCE_MORE_REELECTION is set, stress-test by deliberately
 	// generating a hard-coded number very often. This will create collisions
 	// between different servers and force more re-elections.
-	return time.Duration(150+rand.Intn(150)) * time.Millisecond
+	return time.Duration(400+rand.Intn(150)) * time.Millisecond
 }
 
 // runElectionTimer implements an election timer. It should be launched whenever
@@ -512,7 +510,7 @@ func (rf *Raft) startLeader() {
 				rf.leaderSendAEs()
 			}
 		}
-	}(50 * time.Millisecond)
+	}(100 * time.Millisecond)
 }
 
 // leaderSendAEs sends a round of AEs to all peers, collects their
