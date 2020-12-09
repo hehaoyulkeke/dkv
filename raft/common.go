@@ -3,6 +3,7 @@ package raft
 import (
 	"fmt"
 	"strconv"
+	"time"
 )
 
 const (
@@ -35,3 +36,5 @@ type Op struct {
 	Key    string
 	Value  string
 }
+
+const RPCTimeOut = 100*time.Millisecond

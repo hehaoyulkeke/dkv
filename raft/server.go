@@ -3,9 +3,11 @@ package raft
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 type Message = map[string]interface{}
@@ -32,6 +34,7 @@ type Server struct {
 	applyChs 	map[int]chan int
 	rpcSeq int
 	rpcChs map[int]chan Message
+	unConnectedPeers map[int]int
 }
 
 func NewServer(serverId string, peerIds []int) *Server {
@@ -44,6 +47,7 @@ func NewServer(serverId string, peerIds []int) *Server {
 	s.applyChs = make(map[int]chan int)
 	s.rpcSeq = 1
 	s.rpcChs = make(map[int]chan Message)
+	s.unConnectedPeers = make(map[int]int)
 	return s
 }
 
@@ -68,8 +72,13 @@ func (s *Server) Serve() {
 		req := make(Message)
 		err := dec.Decode(&req)
 		if err != nil {
-			fmt.Println(err)
-			break
+			if err == io.EOF {
+				fmt.Println(s.serverStr+" shutdown")
+				break
+			} else {
+				fmt.Println(err)
+				//return
+			}
 		} else {
 			s.wg.Add(1)
 			go func() {
@@ -213,7 +222,11 @@ func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *Reques
 	s.mu.Lock()
 	rpcSeq := s.rpcSeq
 	s.rpcSeq++
+	unConnectedCnt := s.unConnectedPeers[peerId]
 	s.mu.Unlock()
+	if unConnectedCnt >= 10 {
+		return false
+	}
 	msg := Message{"src": s.serverStr, "dst": int2Str(peerId),
 		"type": REQUEST_VOTE_SEND, "leader": UNKNOWN,
 		"Term": args.Term,
@@ -227,13 +240,13 @@ func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *Reques
 	if err != nil {
 		return false
 	}
-	for {
-		s.mu.Lock()
-		ch := make(chan Message)
-		index := rpcSeq
-		s.rpcChs[index] = ch
-		s.mu.Unlock()
-		resp := <- ch
+	s.mu.Lock()
+	ch := make(chan Message)
+	index := rpcSeq
+	s.rpcChs[index] = ch
+	s.mu.Unlock()
+	select {
+	case resp := <- ch:
 		reply.Term = int(resp["Term"].(float64))
 		reply.VoteGranted = resp["VoteGranted"].(bool)
 		s.wg.Add(1)
@@ -241,7 +254,15 @@ func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *Reques
 			s.closeRpcCh(rpcSeq)
 			s.wg.Done()
 		}()
+		s.mu.Lock()
+		s.unConnectedPeers[peerId]=0
+		s.mu.Unlock()
 		return true
+	case <- time.After(RPCTimeOut):
+		s.mu.Lock()
+		s.unConnectedPeers[peerId]+=1
+		s.mu.Unlock()
+		return false
 	}
 }
 
@@ -294,7 +315,11 @@ func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *Ap
 	s.mu.Lock()
 	rpcSeq := s.rpcSeq
 	s.rpcSeq++
+	unConnectedCnt := s.unConnectedPeers[peerId]
 	s.mu.Unlock()
+	if unConnectedCnt >= 10 {
+		return false
+	}
 	msg := Message{"src": s.serverStr, "dst": int2Str(peerId), "type": APPEND_ENTRIES_SEND,
 		"leader": s.serverStr, "rpcSeq": rpcSeq,
 		"Term": args.Term,
@@ -309,13 +334,13 @@ func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *Ap
 	if err != nil {
 		return false
 	}
-	for {
-		s.mu.Lock()
-		ch := make(chan Message)
-		index := rpcSeq
-		s.rpcChs[index] = ch
-		s.mu.Unlock()
-		resp := <- ch
+	s.mu.Lock()
+	ch := make(chan Message)
+	index := rpcSeq
+	s.rpcChs[index] = ch
+	s.mu.Unlock()
+	select {
+	case resp := <- ch:
 		reply.Term = int(resp["Term"].(float64))
 		reply.Success = resp["Success"].(bool)
 		reply.ConflictIndex = int(resp["ConflictIndex"].(float64))
@@ -326,9 +351,16 @@ func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *Ap
 			s.closeRpcCh(rpcSeq)
 			s.wg.Done()
 		}()
+		s.mu.Lock()
+		s.unConnectedPeers[peerId]=0
+		s.mu.Unlock()
 		return true
+	case <- time.After(RPCTimeOut):
+		s.mu.Lock()
+		s.unConnectedPeers[peerId]+=1
+		s.mu.Unlock()
+		return false
 	}
-
 }
 
 

@@ -1,42 +1,16 @@
 package raft
 
-//
-// this is an outline of the API that raft must expose to
-// the service (or tester). see comments below for
-// each of these functions for more details.
-//
-// rf = Make(...)
-//   create a new Raft server.
-// rf.Start(command interface{}) (index, term, isleader)
-//   start agreement on a new log entry
-// rf.GetState() (term, isLeader)
-//   ask a Raft for its current term, and whether it thinks it is leader
-// ApplyMsg
-//   each time a new entry is committed to the log, each Raft peer
-//   should send an ApplyMsg to the service (or tester)
-//   in the same server.
-//
 
 import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
-import "sync/atomic"
 
 
-//
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make(). set
-// CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
-//
-// in Lab 3 you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh; at that point you can add fields to
-// ApplyMsg, but set CommandValid to false for these other uses.
-//
+
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -83,10 +57,6 @@ type Raft struct {
 	applyCh chan ApplyMsg
 	Logs []LogEntry
 	Applycond *sync.Cond
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
-
 }
 
 func (rf* Raft) FirstEntryWithTerm(term int) int {
@@ -261,7 +231,7 @@ func (rf* Raft) becomeFollowerWithLock() {
 //for candidate and follower only
 func (rf* Raft) electionTimer() {
 	for rf.Role() != LEADER {
-		interval := randTimeout(300,600)
+		interval := randTimeout(500,800)
 		time.Sleep(time.Millisecond * time.Duration(interval))
 		role := rf.Role()
 		if role == FOLLOWER {
@@ -287,7 +257,7 @@ func (rf* Raft) electionTimer() {
 func (rf* Raft) heartBeatTimer() {
 	//send heart per 150 milseconds
 	for rf.Role() == LEADER {
-		time.Sleep(time.Millisecond * 150)
+		time.Sleep(time.Millisecond * 250)
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
