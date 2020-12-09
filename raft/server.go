@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,7 +11,7 @@ import (
 	"time"
 )
 
-type Message = map[string]interface{}
+type Message map[string]interface{}
 
 // Server wraps a raft.Raft along with a rpc.Server that exposes its
 // methods as RPC endpoints. It also manages the peers of the Raft server. The
@@ -34,7 +35,6 @@ type Server struct {
 	applyChs 	map[int]chan int
 	rpcSeq int
 	rpcChs map[int]chan Message
-	unConnectedPeers map[int]int
 }
 
 func NewServer(serverId string, peerIds []int) *Server {
@@ -47,13 +47,12 @@ func NewServer(serverId string, peerIds []int) *Server {
 	s.applyChs = make(map[int]chan int)
 	s.rpcSeq = 1
 	s.rpcChs = make(map[int]chan Message)
-	s.unConnectedPeers = make(map[int]int)
 	return s
 }
 
+
 func (s *Server) Serve() {
 	s.rf = Make(s.serverId, s.peerIds, s, s.applyChan)
-
 	conn, err := net.Dial("unixpacket", s.serverStr)
 	if err != nil {
 		log.Fatal(err)
@@ -61,7 +60,7 @@ func (s *Server) Serve() {
 	defer conn.Close()
 
 	s.enc = json.NewEncoder(conn)
-	dec := json.NewDecoder(conn)
+	dec := json.NewDecoder(bufio.NewReader(conn))
 	s.wg.Add(1)
 	go func() {
 		s.processAppliedOps()
@@ -76,8 +75,8 @@ func (s *Server) Serve() {
 				fmt.Println(s.serverStr+" shutdown")
 				break
 			} else {
-				fmt.Println(err)
-				//return
+				fmt.Println(err, s.serverStr)
+				return
 			}
 		} else {
 			s.wg.Add(1)
@@ -222,11 +221,7 @@ func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *Reques
 	s.mu.Lock()
 	rpcSeq := s.rpcSeq
 	s.rpcSeq++
-	unConnectedCnt := s.unConnectedPeers[peerId]
 	s.mu.Unlock()
-	if unConnectedCnt >= 10 {
-		return false
-	}
 	msg := Message{"src": s.serverStr, "dst": int2Str(peerId),
 		"type": REQUEST_VOTE_SEND, "leader": UNKNOWN,
 		"Term": args.Term,
@@ -254,14 +249,8 @@ func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *Reques
 			s.closeRpcCh(rpcSeq)
 			s.wg.Done()
 		}()
-		s.mu.Lock()
-		s.unConnectedPeers[peerId]=0
-		s.mu.Unlock()
 		return true
 	case <- time.After(RPCTimeOut):
-		s.mu.Lock()
-		s.unConnectedPeers[peerId]+=1
-		s.mu.Unlock()
 		return false
 	}
 }
@@ -315,9 +304,8 @@ func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *Ap
 	s.mu.Lock()
 	rpcSeq := s.rpcSeq
 	s.rpcSeq++
-	unConnectedCnt := s.unConnectedPeers[peerId]
 	s.mu.Unlock()
-	if unConnectedCnt >= 10 {
+	if len(args.Entries) >= 100 {
 		return false
 	}
 	msg := Message{"src": s.serverStr, "dst": int2Str(peerId), "type": APPEND_ENTRIES_SEND,
@@ -351,14 +339,8 @@ func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *Ap
 			s.closeRpcCh(rpcSeq)
 			s.wg.Done()
 		}()
-		s.mu.Lock()
-		s.unConnectedPeers[peerId]=0
-		s.mu.Unlock()
 		return true
 	case <- time.After(RPCTimeOut):
-		s.mu.Lock()
-		s.unConnectedPeers[peerId]+=1
-		s.mu.Unlock()
 		return false
 	}
 }
