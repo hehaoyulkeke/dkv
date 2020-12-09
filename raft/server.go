@@ -26,7 +26,7 @@ type Server struct {
 
 	rf      *Raft
 	db  Storage
-	commitChan  chan CommitEntry
+	applyChan  chan ApplyMsg
 	wg    sync.WaitGroup
 	enc *json.Encoder
 	applyChs 	map[int]chan int
@@ -40,7 +40,7 @@ func NewServer(serverId string, peerIds []int) *Server {
 	s.serverId = str2Int(serverId)
 	s.peerIds = peerIds
 	s.db = NewMapStorage()
-	s.commitChan = make(chan CommitEntry)
+	s.applyChan = make(chan ApplyMsg)
 	s.applyChs = make(map[int]chan int)
 	s.rpcSeq = 1
 	s.rpcChs = make(map[int]chan Message)
@@ -48,7 +48,7 @@ func NewServer(serverId string, peerIds []int) *Server {
 }
 
 func (s *Server) Serve() {
-	s.rf = NewRaft(s.serverId, s.peerIds, s, s.commitChan)
+	s.rf = Make(s.serverId, s.peerIds, s, s.applyChan)
 
 	conn, err := net.Dial("unixpacket", s.serverStr)
 	if err != nil {
@@ -121,7 +121,7 @@ func (s *Server) handleGet(msg Message) Message {
 	reply := s.newReply(msg)
 	op := Op{msg["type"].(string), msg["key"].(string), ""}
 
-	index, term, isLeader := s.rf.Submit(op)
+	index, _, isLeader := s.rf.Start(op)
 	if !isLeader{
 		reply["type"] = REDIRECT
 		reply["leader"] = s.nextServer()
@@ -134,16 +134,14 @@ func (s *Server) handleGet(msg Message) Message {
 	s.mu.Unlock()
 
 	select{
-	case msgTerm := <- ch:
-		if msgTerm == term {
-			s.dbLock.RLock()
-			if val, ok := s.db.Get(msg["key"].(string)); ok{
-				reply["value"] = val
-			} else {
-				reply["value"] = ""
-			}
-			s.dbLock.RUnlock()
+	case <- ch:
+		s.dbLock.RLock()
+		if val, ok := s.db.Get(msg["key"].(string)); ok{
+			reply["value"] = val
+		} else {
+			reply["value"] = ""
 		}
+		s.dbLock.RUnlock()
 	}
 
 	s.wg.Add(1)
@@ -160,7 +158,7 @@ func (s *Server) handlePut(msg Message) Message {
 	reply := s.newReply(msg)
 	op := Op{msg["type"].(string), msg["key"].(string), msg["value"].(string)}
 
-	index, _, isLeader := s.rf.Submit(op)
+	index, _, isLeader := s.rf.Start(op)
 	if !isLeader{
 		reply["type"] = REDIRECT
 		reply["leader"] = s.nextServer()
@@ -195,14 +193,11 @@ func (s *Server) handleRequestVoteSend(msg Message) Message {
 	}
 	requestReply := new(RequestVoteReply)
 	reply := s.newReply(msg)
-	if err := s.rf.RequestVote(args, requestReply); err != nil {
-		reply["type"] = FAIL
-	} else {
-		reply["type"] = REQUEST_VOTE_RECV
-		reply["Term"] = requestReply.Term
-		reply["VoteGranted"] = requestReply.VoteGranted
-		reply["rpcSeq"] = msg["rpcSeq"]
-	}
+	s.rf.RequestVote(&args, requestReply)
+	reply["type"] = REQUEST_VOTE_RECV
+	reply["Term"] = requestReply.Term
+	reply["VoteGranted"] = requestReply.VoteGranted
+	reply["rpcSeq"] = msg["rpcSeq"]
 	return reply
 }
 
@@ -214,7 +209,7 @@ func (s *Server) handleRequestVoteRecv(msg Message) {
 	ch <- msg
 }
 
-func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *RequestVoteReply) error {
+func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *RequestVoteReply) bool {
 	s.mu.Lock()
 	rpcSeq := s.rpcSeq
 	s.rpcSeq++
@@ -230,7 +225,7 @@ func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *Reques
 
 	err := s.enc.Encode(&msg)
 	if err != nil {
-		return err
+		return false
 	}
 	for {
 		s.mu.Lock()
@@ -246,7 +241,7 @@ func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *Reques
 			s.closeRpcCh(rpcSeq)
 			s.wg.Done()
 		}()
-		return nil
+		return true
 	}
 }
 
@@ -266,6 +261,8 @@ func (s *Server) handleAppendEntriesSend(msg Message) Message {
 			e := LogEntry{
 				Command: tmp["Command"],
 				Term:    int(tmp["Term"].(float64)),
+				Index: int(tmp["Index"].(float64)),
+				Granted: int(tmp["Granted"].(float64)),
 			}
 			args.Entries[i] = e
 		}
@@ -274,16 +271,14 @@ func (s *Server) handleAppendEntriesSend(msg Message) Message {
 	}
 	appendReply := new(AppendEntriesReply)
 	reply := s.newReply(msg)
-	if err := s.rf.AppendEntries(args, appendReply); err != nil {
-		reply["type"] = FAIL
-	} else {
-		reply["type"] = APPEND_ENTRIES_RECV
-		reply["Term"] = appendReply.Term
-		reply["Success"] = appendReply.Success
-		reply["ConflictIndex"] = appendReply.ConflictIndex
-		reply["ConflictTerm"] = appendReply.ConflictTerm
-		reply["rpcSeq"] = msg["rpcSeq"]
-	}
+	s.rf.AppendEntries(&args, appendReply)
+	reply["type"] = APPEND_ENTRIES_RECV
+	reply["Term"] = appendReply.Term
+	reply["Success"] = appendReply.Success
+	reply["ConflictIndex"] = appendReply.ConflictIndex
+	reply["ConflictTerm"] = appendReply.ConflictTerm
+	reply["LogLen"] = appendReply.LogLen
+	reply["rpcSeq"] = msg["rpcSeq"]
 	return reply
 }
 
@@ -295,13 +290,13 @@ func (s *Server) handleAppendEntriesRecv(msg Message) {
 	ch <- msg
 }
 
-func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *AppendEntriesReply) error {
+func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	s.mu.Lock()
 	rpcSeq := s.rpcSeq
 	s.rpcSeq++
 	s.mu.Unlock()
 	msg := Message{"src": s.serverStr, "dst": int2Str(peerId), "type": APPEND_ENTRIES_SEND,
-		"leader": UNKNOWN, "rpcSeq": rpcSeq,
+		"leader": s.serverStr, "rpcSeq": rpcSeq,
 		"Term": args.Term,
 		"LeaderId": args.LeaderId,
 		"PrevLogIndex": args.PrevLogIndex,
@@ -312,7 +307,7 @@ func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *Ap
 
 	err := s.enc.Encode(&msg)
 	if err != nil {
-		return err
+		return false
 	}
 	for {
 		s.mu.Lock()
@@ -325,28 +320,28 @@ func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *Ap
 		reply.Success = resp["Success"].(bool)
 		reply.ConflictIndex = int(resp["ConflictIndex"].(float64))
 		reply.ConflictTerm = int(resp["ConflictTerm"].(float64))
+		reply.LogLen = int(resp["LogLen"].(float64))
 		s.wg.Add(1)
 		go func() {
 			s.closeRpcCh(rpcSeq)
 			s.wg.Done()
 		}()
-		return nil
+		return true
 	}
 
 }
 
 
 func (s *Server) processAppliedOps(){
-	for commitEntry := range s.commitChan {
-		index := commitEntry.Index
-		term := commitEntry.Term
+	for applyMsg := range s.applyChan {
+		index := applyMsg.CommandIndex
 
 		var op Op
-		switch commitEntry.Command.(type) {
+		switch applyMsg.Command.(type) {
 		case Op:
-			op = commitEntry.Command.(Op)
+			op = applyMsg.Command.(Op)
 		case map[string]interface{}:
-			tmp := commitEntry.Command.(map[string]interface{})
+			tmp := applyMsg.Command.(map[string]interface{})
 			op = Op{tmp["Method"].(string), tmp["Key"].(string), tmp["Value"].(string)}
 		}
 		switch op.Method {
@@ -360,7 +355,7 @@ func (s *Server) processAppliedOps(){
 		if ch, ok := s.applyChs[index]; ok{
 			s.wg.Add(1)
 			go func() {
-				ch <- term
+				ch <- 1
 				s.wg.Done()
 			}()
 		}
