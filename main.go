@@ -1,7 +1,7 @@
 package main
 
 import (
-	"dkv/raft"
+	"3700kvstore/raft"
 	"os"
 	"strconv"
 )

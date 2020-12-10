@@ -13,28 +13,22 @@ import (
 
 type Message map[string]interface{}
 
-// Server wraps a raft.Raft along with a rpc.Server that exposes its
-// methods as RPC endpoints. It also manages the peers of the Raft server. The
-// main goal of this type is to simplify the code of raft.Server for
-// presentation purposes. raft.Raft has a *Server to do its peer
-// communication and doesn't have to worry about the specifics of running an
-// RPC server.
 type Server struct {
-	mu sync.Mutex
+	mu     sync.Mutex
 	dbLock sync.RWMutex
 
-	serverId int
+	serverId  int
 	serverStr string
-	peerIds  []int
+	peerIds   []int
 
-	rf      *Raft
-	db  Storage
-	applyChan  chan ApplyMsg
-	wg    sync.WaitGroup
-	enc *json.Encoder
-	applyChs 	map[int]chan int
-	rpcSeq int
-	rpcChs map[int]chan Message
+	rf        *Raft
+	db        Storage
+	applyChan chan ApplyMsg
+	wg        sync.WaitGroup
+	enc       *json.Encoder
+	applyChs  map[int]chan int
+	rpcSeq    int
+	rpcChs    map[int]chan Message
 }
 
 func NewServer(serverId string, peerIds []int) *Server {
@@ -49,7 +43,6 @@ func NewServer(serverId string, peerIds []int) *Server {
 	s.rpcChs = make(map[int]chan Message)
 	return s
 }
-
 
 func (s *Server) Serve() {
 	s.rf = Make(s.serverId, s.peerIds, s, s.applyChan)
@@ -72,7 +65,7 @@ func (s *Server) Serve() {
 		err := dec.Decode(&req)
 		if err != nil {
 			if err == io.EOF {
-				fmt.Println(s.serverStr+" shutdown")
+				fmt.Println(s.serverStr + " shutdown")
 				break
 			} else {
 				fmt.Println(err, s.serverStr)
@@ -111,7 +104,7 @@ func (s *Server) handleMessage(msg Message) {
 	}
 }
 
-func (s *Server) newReply(msg Message) Message{
+func (s *Server) newReply(msg Message) Message {
 	reply := make(Message)
 	reply["src"] = s.serverStr
 	reply["dst"] = msg["src"]
@@ -121,7 +114,7 @@ func (s *Server) newReply(msg Message) Message{
 }
 
 func (s *Server) nextServer() string {
-	next := (s.serverId+1)%(len(s.peerIds)+1)
+	next := (s.serverId + 1) % (len(s.peerIds) + 1)
 	return int2Str(next)
 }
 
@@ -130,7 +123,7 @@ func (s *Server) handleGet(msg Message) Message {
 	op := Op{msg["type"].(string), msg["key"].(string), ""}
 
 	index, _, isLeader := s.rf.Start(op)
-	if !isLeader{
+	if !isLeader {
 		reply["type"] = REDIRECT
 		reply["leader"] = s.nextServer()
 		return reply
@@ -141,10 +134,10 @@ func (s *Server) handleGet(msg Message) Message {
 	s.applyChs[index] = ch
 	s.mu.Unlock()
 
-	select{
-	case <- ch:
+	select {
+	case <-ch:
 		s.dbLock.RLock()
-		if val, ok := s.db.Get(msg["key"].(string)); ok{
+		if val, ok := s.db.Get(msg["key"].(string)); ok {
 			reply["value"] = val
 		} else {
 			reply["value"] = ""
@@ -167,7 +160,7 @@ func (s *Server) handlePut(msg Message) Message {
 	op := Op{msg["type"].(string), msg["key"].(string), msg["value"].(string)}
 
 	index, _, isLeader := s.rf.Start(op)
-	if !isLeader{
+	if !isLeader {
 		reply["type"] = REDIRECT
 		reply["leader"] = s.nextServer()
 		return reply
@@ -178,8 +171,8 @@ func (s *Server) handlePut(msg Message) Message {
 	s.applyChs[index] = ch
 	s.mu.Unlock()
 
-	select{
-	case <- ch:
+	select {
+	case <-ch:
 	}
 	s.wg.Add(1)
 	go func() {
@@ -190,7 +183,6 @@ func (s *Server) handlePut(msg Message) Message {
 	reply["type"] = OK
 	return reply
 }
-
 
 func (s *Server) handleRequestVoteSend(msg Message) Message {
 	args := RequestVoteArgs{
@@ -224,11 +216,11 @@ func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *Reques
 	s.mu.Unlock()
 	msg := Message{"src": s.serverStr, "dst": int2Str(peerId),
 		"type": REQUEST_VOTE_SEND, "leader": UNKNOWN,
-		"Term": args.Term,
-		"CandidateId": args.CandidateId,
+		"Term":         args.Term,
+		"CandidateId":  args.CandidateId,
 		"LastLogIndex": args.LastLogIndex,
-		"LastLogTerm": args.LastLogTerm,
-		"rpcSeq": rpcSeq,
+		"LastLogTerm":  args.LastLogTerm,
+		"rpcSeq":       rpcSeq,
 	}
 
 	err := s.enc.Encode(&msg)
@@ -241,7 +233,7 @@ func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *Reques
 	s.rpcChs[index] = ch
 	s.mu.Unlock()
 	select {
-	case resp := <- ch:
+	case resp := <-ch:
 		reply.Term = int(resp["Term"].(float64))
 		reply.VoteGranted = resp["VoteGranted"].(bool)
 		s.wg.Add(1)
@@ -250,7 +242,7 @@ func (s *Server) sendRequestVote(peerId int, args RequestVoteArgs, reply *Reques
 			s.wg.Done()
 		}()
 		return true
-	case <- time.After(RPCTimeOut):
+	case <-time.After(RPCTimeOut):
 		return false
 	}
 }
@@ -271,7 +263,7 @@ func (s *Server) handleAppendEntriesSend(msg Message) Message {
 			e := LogEntry{
 				Command: tmp["Command"],
 				Term:    int(tmp["Term"].(float64)),
-				Index: int(tmp["Index"].(float64)),
+				Index:   int(tmp["Index"].(float64)),
 				Granted: int(tmp["Granted"].(float64)),
 			}
 			args.Entries[i] = e
@@ -310,11 +302,11 @@ func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *Ap
 	}
 	msg := Message{"src": s.serverStr, "dst": int2Str(peerId), "type": APPEND_ENTRIES_SEND,
 		"leader": s.serverStr, "rpcSeq": rpcSeq,
-		"Term": args.Term,
-		"LeaderId": args.LeaderId,
+		"Term":         args.Term,
+		"LeaderId":     args.LeaderId,
 		"PrevLogIndex": args.PrevLogIndex,
-		"PrevLogTerm": args.PrevLogTerm,
-		"Entries": args.Entries,
+		"PrevLogTerm":  args.PrevLogTerm,
+		"Entries":      args.Entries,
 		"LeaderCommit": args.LeaderCommit,
 	}
 
@@ -328,7 +320,7 @@ func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *Ap
 	s.rpcChs[index] = ch
 	s.mu.Unlock()
 	select {
-	case resp := <- ch:
+	case resp := <-ch:
 		reply.Term = int(resp["Term"].(float64))
 		reply.Success = resp["Success"].(bool)
 		reply.ConflictIndex = int(resp["ConflictIndex"].(float64))
@@ -340,13 +332,12 @@ func (s *Server) sendAppendEntries(peerId int, args AppendEntriesArgs, reply *Ap
 			s.wg.Done()
 		}()
 		return true
-	case <- time.After(RPCTimeOut):
+	case <-time.After(RPCTimeOut):
 		return false
 	}
 }
 
-
-func (s *Server) processAppliedOps(){
+func (s *Server) processAppliedOps() {
 	for applyMsg := range s.applyChan {
 		index := applyMsg.CommandIndex
 
@@ -366,7 +357,7 @@ func (s *Server) processAppliedOps(){
 		case GET:
 		}
 		s.mu.Lock()
-		if ch, ok := s.applyChs[index]; ok{
+		if ch, ok := s.applyChs[index]; ok {
 			s.wg.Add(1)
 			go func() {
 				ch <- 1
@@ -378,14 +369,14 @@ func (s *Server) processAppliedOps(){
 	}
 }
 
-func (s *Server) closeApplyCh(index int){
+func (s *Server) closeApplyCh(index int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	close(s.applyChs[index])
 	delete(s.applyChs, index)
 }
 
-func (s *Server) closeRpcCh(index int){
+func (s *Server) closeRpcCh(index int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	close(s.rpcChs[index])
